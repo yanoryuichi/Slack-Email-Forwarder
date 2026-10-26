@@ -1,0 +1,9 @@
+**/**
+!appsscript.json
+!**/*.gs
+!**/*.js
+!**/*.html
+**/node_modules/**
+**/secrets/**
+**/private/**
+**/*.local.*

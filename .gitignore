@@ -1,0 +1,24 @@
+# Local connection and OAuth credentials
+.clasp.json
+.clasp.*.json
+!.clasp.example.json
+.clasprc*
+credentials*.json
+client_secret*.json
+service-account*.json
+*.pem
+*.key
+
+# Actual properties / local exports
+.env
+.env.*
+!.env.example
+script-properties*.json
+secrets/
+private/
+backups/
+*.local.*
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
