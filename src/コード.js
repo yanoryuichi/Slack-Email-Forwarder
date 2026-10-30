@@ -7,18 +7,32 @@
  * - SLACK_CHANNEL_ID
  * - MAIL_TO
  *
+ * 任意: SLACK_USER_TOKEN（Botでスレッド取得できない場合）
+ *
  * 自動生成:
  * - LAST_TS
  * - SLACK_USER_<USER_ID>
  */
 
 const TIME_ZONE = 'Asia/Tokyo';
+const MAX_SCAN_MILLISECONDS = 4 * 60 * 1000;
+const MAX_SCAN_REQUESTS = 200;
 
 /**
  * Slack新着メッセージを確認してメール送信する。
  * 時間主導トリガーから定期実行する想定。
  */
 function checkSlackMessages() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return;
+  try {
+    forwardSlackMessages_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function forwardSlackMessages_() {
   const props = PropertiesService.getScriptProperties();
 
   const token = requireProperty_(props, 'SLACK_BOT_TOKEN');
@@ -27,15 +41,15 @@ function checkSlackMessages() {
 
   const lastTs = props.getProperty('LAST_TS') || '0';
 
-  const messages = fetchSlackMessages_(token, channelId, lastTs);
+  const threadToken = props.getProperty('SLACK_USER_TOKEN') || token;
+  const messages = fetchSlackMessages_(token, channelId, lastTs, threadToken);
 
   if (messages.length === 0) {
     console.log('新着メッセージはありません。');
     return;
   }
 
-  // conversations.history は新しい順なので古い順にする
-  messages.reverse();
+  // 通常投稿と返信は取得時に重複を除去し、古い順に整列済み。
 
   const body = messages
     .map((message, index) => {
@@ -63,7 +77,7 @@ function checkSlackMessages() {
 /**
  * 初回実行用。
  *
- * 現在の最新メッセージを「処理済み」として記録する。
+ * 現在時刻までの通常投稿・返信を「処理済み」として記録する。
  * これを最初に1回実行してから checkSlackMessages() を使う。
  */
 function initializeLastTs() {
@@ -77,15 +91,9 @@ function initializeLastTs() {
     '?channel=' + encodeURIComponent(channelId) +
     '&limit=1';
 
-  const data = callSlackApi_(url, token);
-
-  if (!data.messages || data.messages.length === 0) {
-    throw new Error(
-      'Slackチャンネルにメッセージがありません。'
-    );
-  }
-
-  const latestTs = data.messages[0].ts;
+  const latestTs = (Date.now() / 1000).toFixed(6);
+  // アクセスを確認してから初期化する。空のチャンネルでも可。
+  callSlackApi_(url, token);
 
   props.setProperty('LAST_TS', latestTs);
 
@@ -125,23 +133,96 @@ function clearLastTs() {
 
 
 /**
- * Slackから前回以降のメッセージを取得する。
+ * 古い親投稿への新しい返信も検出するため、アクセス可能な履歴を全ページ確認する。
+ * 途中で失敗した場合は送信・LAST_TS更新を行わない。
  */
-function fetchSlackMessages_(token, channelId, lastTs) {
-  const params = [
-    'channel=' + encodeURIComponent(channelId),
-    'oldest=' + encodeURIComponent(lastTs),
-    'inclusive=false',
-    'limit=100',
-  ];
+function fetchSlackMessages_(token, channelId, lastTs, threadToken) {
+  const scan = { startedAt: Date.now(), requests: 0 };
+  const latest = (scan.startedAt / 1000).toFixed(6);
+  const messages = new Map();
+  const threads = new Set();
+  readSlackPages_('conversations.history', token, {
+    channel: channelId, latest: latest, inclusive: 'false', limit: '100',
+  }, scan, function(page) {
+    page.forEach(function(message) {
+      if (isWithinWindow_(message.ts, lastTs, latest)) messages.set(message.ts, message);
+      const rootTs = message.thread_ts || message.ts;
+      if (message.reply_count > 0 && rootTs === message.ts &&
+          (!message.latest_reply || compareSlackTs_(message.latest_reply, lastTs) > 0)) {
+        threads.add(rootTs);
+      }
+    });
+  });
+  threads.forEach(function(rootTs) {
+    readSlackPages_('conversations.replies', threadToken || token, {
+      channel: channelId, ts: rootTs, oldest: lastTs,
+      latest: latest, inclusive: 'false', limit: '100',
+    }, scan, function(page) {
+      page.forEach(function(message) {
+        if (message.ts !== rootTs && isWithinWindow_(message.ts, lastTs, latest)) {
+          messages.set(message.ts, Object.assign({}, message, { thread_ts: rootTs }));
+        }
+      });
+    });
+  });
+  ensureScanBudget_(scan);
+  return Array.from(messages.values()).sort(function(a, b) {
+    return compareSlackTs_(a.ts, b.ts);
+  });
+}
 
-  const url =
-    'https://slack.com/api/conversations.history?' +
-    params.join('&');
+function isWithinWindow_(ts, oldest, latest) {
+  return compareSlackTs_(ts, oldest) > 0 && compareSlackTs_(ts, latest) < 0;
+}
 
-  const data = callSlackApi_(url, token);
+// Slackのタイムスタンプをマイクロ秒精度で比較する。
+function compareSlackTs_(left, right) {
+  const a = String(left).split('.');
+  const b = String(right).split('.');
+  const seconds = Number(a[0]) - Number(b[0]);
+  if (seconds !== 0) return seconds;
+  return Number((a[1] || '').padEnd(6, '0')) - Number((b[1] || '').padEnd(6, '0'));
+}
 
-  return data.messages || [];
+function ensureScanBudget_(scan) {
+  if (Date.now() - scan.startedAt >= MAX_SCAN_MILLISECONDS) {
+    throw new Error('履歴の確認が制限時間を超えました。送信とLAST_TS更新は行いません。');
+  }
+}
+
+function readSlackPages_(method, token, params, scan, onPage) {
+  let cursor = '';
+  const seen = new Set();
+  do {
+    ensureScanBudget_(scan);
+    if (scan.requests >= MAX_SCAN_REQUESTS) {
+      throw new Error('履歴取得の上限200リクエストに達しました。送信とLAST_TS更新は行いません。');
+    }
+    const query = Object.assign({}, params);
+    if (cursor) query.cursor = cursor;
+    const url = 'https://slack.com/api/' + method + '?' + Object.keys(query)
+      .map(function(key) { return encodeURIComponent(key) + '=' + encodeURIComponent(query[key]); })
+      .join('&');
+    scan.requests += 1;
+    let data;
+    try {
+      data = callSlackApi_(url, token);
+    } catch (error) {
+      if (method === 'conversations.replies') {
+        throw new Error('スレッド取得に失敗しました。Botの権限で取得できない場合は、' +
+          '必要な履歴権限を持つSLACK_USER_TOKENを設定してください。' + error.message);
+      }
+      throw error;
+    }
+    if (!Array.isArray(data.messages)) throw new Error('Slackの応答にmessagesがありません。');
+    onPage(data.messages);
+    cursor = ((data.response_metadata || {}).next_cursor || '').trim();
+    if (data.has_more && !cursor) {
+      throw new Error('Slackが続きのカーソルを返しませんでした。LAST_TSは更新しません。');
+    }
+    if (cursor && seen.has(cursor)) throw new Error('Slackのページカーソルが重複しています。');
+    if (cursor) seen.add(cursor);
+  } while (cursor);
 }
 
 
@@ -288,6 +369,12 @@ function formatMessage_(token, message, index) {
     lines.push(`投稿者: ${userName}`);
   }
 
+  if (message.thread_ts && message.thread_ts !== message.ts) {
+    lines.push('種別: スレッド返信');
+    lines.push('親投稿日時: ' + Utilities.formatDate(
+      new Date(Number(message.thread_ts) * 1000), TIME_ZONE, 'yyyy-MM-dd HH:mm:ss'
+    ));
+  }
   lines.push('');
   lines.push(text);
 
